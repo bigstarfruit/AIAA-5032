@@ -12,15 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data_loader.data_utils import data_gen, gen_batch
-from models.base_model import build_model
-from models.tester import resolve_checkpoint
-from utils.math_graph import cheb_poly_approx, scaled_laplacian, weight_matrix
+from data_loader.data_utils import gen_batch
+from engine.data import build_graph_kernel, load_dataset
+from engine.experiment import resolve_checkpoint
+from engine.model_registry import get_model_runtime
 from utils.math_utils import MAE, MAPE, RMSE, z_inverse
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate visualization figures for trained STGCN runs.")
+    parser = argparse.ArgumentParser(description="Generate visualization figures for trained runs.")
     parser.add_argument("--run_meta", type=str, default="./output/models/run_meta.json")
     parser.add_argument("--history", type=str, default="./output/models/history.json")
     parser.add_argument("--test_results", type=str, default="./output/models/test_results.json")
@@ -40,60 +40,46 @@ def ensure_dir(path):
     return path
 
 
-def resolve_dataset_file(dataset_dir, filename):
-    candidates = [
-        Path(dataset_dir) / filename,
-        Path(dataset_dir) / "PeMSD7_Full" / filename,
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"Cannot find dataset file {filename} under {dataset_dir}.")
-
-
 def load_run_args(run_meta_path):
     with open(run_meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     return SimpleNamespace(**meta["args"])
 
 
-def build_graph_kernel(args):
-    if args.graph == "default":
-        graph_file = resolve_dataset_file(args.dataset_dir, f"PeMSD7_W_{args.n_route}.csv")
-    else:
-        graph_file = resolve_dataset_file(args.dataset_dir, args.graph)
-    W = weight_matrix(str(graph_file))
-    L = scaled_laplacian(W)
-    return cheb_poly_approx(L, args.ks, args.n_route), W
-
-
-def load_dataset(args):
-    data_file = resolve_dataset_file(args.dataset_dir, f"PeMSD7_V_{args.n_route}.csv")
-    return data_gen(str(data_file), (34, 5, 5), args.n_route, args.n_his + args.n_pred)
-
-
-def load_model(args, blocks, graph_kernel, device, checkpoint_dir):
+def load_model(args, graph_kernel, device, checkpoint_dir):
     checkpoint_path = resolve_checkpoint(checkpoint_dir)
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = build_model(args, blocks, graph_kernel, device)
+    runtime = get_model_runtime(args.model_name)
+    model = runtime.build_fn(args, graph_kernel, device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint_path
 
 
 @torch.no_grad()
-def predict_all_steps(model, seq, batch_size, n_his, n_pred, device):
-    all_batches = []
+def predict_all_steps(model, seq, batch_size, n_his, n_pred, device, direct_multi_step=False):
+    pred_list = []
+    model.eval()
     for batch in gen_batch(seq, min(batch_size, len(seq)), dynamic_batch=True):
-        test_seq = np.copy(batch[:, 0:n_his + 1, :, :])
+        history = np.copy(batch[:, 0:n_his, :, :])
+        if direct_multi_step:
+            pred = model(torch.as_tensor(history, dtype=torch.float32, device=device)).cpu().numpy()
+            pred_list.append(pred)
+            continue
+
         step_preds = []
+        test_seq = history
         for _ in range(n_pred):
             pred = model(torch.as_tensor(test_seq, dtype=torch.float32, device=device)).cpu().numpy()
             test_seq[:, 0:n_his - 1, :, :] = test_seq[:, 1:n_his, :, :]
             test_seq[:, n_his - 1, :, :] = pred
             step_preds.append(pred)
-        all_batches.append(step_preds)
-    return np.concatenate(all_batches, axis=1)
+        pred_list.append(step_preds)
+
+    if direct_multi_step:
+        pred_array = np.concatenate(pred_list, axis=0)
+        return np.transpose(pred_array, (1, 0, 2, 3))
+    return np.concatenate(pred_list, axis=1)
 
 
 def collect_step_metrics(x_test, preds, stats, n_his):
@@ -253,11 +239,10 @@ def main():
     run_args = load_run_args(cli_args.run_meta)
     run_args.dataset_dir = cli_args.dataset_dir
     device = torch.device(cli_args.device)
-    blocks = [[1, 32, 64], [64, 32, 128]]
 
     graph_kernel, W = build_graph_kernel(run_args)
     dataset = load_dataset(run_args)
-    model, checkpoint_path = load_model(run_args, blocks, graph_kernel, device, cli_args.checkpoint_dir)
+    model, checkpoint_path = load_model(run_args, graph_kernel, device, cli_args.checkpoint_dir)
 
     with open(cli_args.history, "r", encoding="utf-8") as f:
         history = json.load(f)
@@ -267,7 +252,7 @@ def main():
         best_meta = json.load(f)
 
     x_test = dataset.get_data("test")
-    preds = predict_all_steps(model, x_test, run_args.batch_size, run_args.n_his, run_args.n_pred, device)
+    preds = predict_all_steps(model, x_test, run_args.batch_size, run_args.n_his, run_args.n_pred, device, getattr(run_args, "direct_multi_step", False))
     step_metrics, targets = collect_step_metrics(x_test, preds, dataset.get_stats(), run_args.n_his)
     preds_real = z_inverse(preds, dataset.mean, dataset.std)
 
